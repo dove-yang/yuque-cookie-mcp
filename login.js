@@ -36,8 +36,9 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 const playwright_1 = require("playwright");
 const fs = __importStar(require("fs"));
+const os = __importStar(require("os"));
 const path = __importStar(require("path"));
-const CONFIG_DIR = path.join(process.env.HOME || '', '.yuque-mcp');
+const CONFIG_DIR = path.join(os.homedir(), '.yuque-mcp');
 const COOKIE_FILE = path.join(CONFIG_DIR, 'cookies.json');
 // 组织域名列表（登录后会自动访问这些域名以获取 Cookie）
 const ORG_DOMAINS = [

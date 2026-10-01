@@ -19,6 +19,28 @@
 
 ## 功能
 
+### Cookie 文档格式兼容性
+
+Cookie 模式的 `create_doc` / `update_doc` 及公司空间对应工具，默认仍接收 Markdown，
+但先通过语雀 `/api/docs/convert` 转为 Lake，再以 `format: lake`、`origin_format: lake`
+保存，避免出现网页发布错误 `invalid format: markdown, can not save use body field`。
+转换失败会中止写入，不回退到原来的 Markdown 保存方式。此补丁不自动发布文档。
+内部写入同时维护 `body` 和编辑器使用的 `body_asl`，避免仅更新旧字段导致发布内容为空。
+
+- 写入工具新增 `format: markdown | lake`（这是输入格式，不是 Cookie 文档的存储格式）。
+- 读取工具新增 `include_lake: true`，返回可用于保留原始排版的 `body_lake`。
+- Cookie 读取支持 `include_draft: true`，用于检查未发布的编辑正文；默认仍读已发布正文。
+- `body` 是供阅读的 Markdown/近似 Markdown；`body_is_lossy` 明确提示可能丢失富文本细节。
+  不要把阅读用的 `body` 当作无损备份：复杂卡片、图片、表格应在 Lake 原文上编辑。
+- 更新工具支持 `expected_updated_at`，在写入前尽力检测并发修改；不是服务器原子锁。
+- 标题更新不会强制改动正文或格式；空正文不再被静默忽略。
+- 登录和读取 Cookie 统一使用 `os.homedir()` 定位用户目录，兼容没有 `HOME` 环境变量的 Windows。
+- Token 分支继续走原有 OpenAPI；上述格式转换针对 Cookie 模式。
+  官方新版 Markdown/YMD 路由不在本次修改范围内。
+- 代码已修改后，需要重连 MCP 或重启宿主应用，旧进程不会自动加载新代码。
+
+运行通用回归测试：`npm test`。测试使用模拟接口，不读取 Cookie 或修改线上文档。
+
 ### 通用工具
 
 | 工具 | 说明 |

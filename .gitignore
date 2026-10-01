@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.yuque-mcp/
+cookies.json
+*-report.json
+yuque-backups/
+backup-before-install/
+live-smoke.cjs
+installed-mcp-check.cjs

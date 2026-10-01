@@ -36,11 +36,13 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.YuqueClient = void 0;
 const axios_1 = __importStar(require("axios"));
 const fs = __importStar(require("fs"));
+const os = __importStar(require("os"));
 const path = __importStar(require("path"));
 const YUQUE_BASE_URL = 'https://www.yuque.com';
 const ORG_BASE_URL = 'https://bd-tech.yuque.com';
-const CONFIG_DIR = path.join(process.env.HOME || '', '.yuque-mcp');
+const CONFIG_DIR = path.join(os.homedir(), '.yuque-mcp');
 const COOKIE_FILE = path.join(CONFIG_DIR, 'cookies.json');
+const BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 class YuqueClient {
     client;
     authType;
@@ -68,7 +70,7 @@ class YuqueClient {
                 headers: {
                     'Cookie': cookie,
                     'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                    'User-Agent': BROWSER_USER_AGENT,
                     'Referer': 'https://www.yuque.com/',
                     'x-csrf-token': ctoken
                 }
@@ -276,7 +278,62 @@ class YuqueClient {
             this.handleError(error);
         }
     }
-    async getDoc(bookId, slug) {
+    validateBodyFormat(format) {
+        if (!['markdown', 'lake'].includes(format)) {
+            throw new Error('正文输入格式仅支持 markdown 或 lake；format 表示输入格式，不会把 Cookie 文档改成 Markdown 类型。');
+        }
+    }
+    async prepareCookieBody(body, format = 'markdown', httpClient = this.client) {
+        this.validateBodyFormat(format);
+        if (typeof body !== 'string') throw new Error('body 必须是字符串');
+        let lake = body;
+        if (format === 'markdown') {
+            // 官方网页转换接口只转换内容，不创建或修改任何文档。
+            const response = await httpClient.post('/api/docs/convert', {
+                from: 'markdown', to: 'lake', content: body
+            }, { timeout: 30000 });
+            lake = response.data?.data?.content;
+        }
+        if (typeof lake !== 'string' || !/^\s*<!doctype lake>/i.test(lake)) {
+            throw new Error('Lake 正文无效或 Markdown 转换失败，已停止写入；不会回退到不兼容的 Markdown 保存方式。');
+        }
+        return { body: lake, body_asl: lake, format: 'lake', origin_format: 'lake', _lake_is_asl: true };
+    }
+    getOrgCookieClient() {
+        const { cookie, ctoken } = this.loadCookie();
+        if (!cookie) throw new Error('请先登录');
+        return axios_1.default.create({
+            baseURL: ORG_BASE_URL,
+            headers: {
+                'Cookie': cookie, 'Content-Type': 'application/json',
+                'User-Agent': BROWSER_USER_AGENT, 'Referer': `${ORG_BASE_URL}/`,
+                'x-csrf-token': ctoken
+            }
+        });
+    }
+    readableCookieDoc(doc, includeLake = false) {
+        const bodyIsLake = typeof doc.body === 'string' && /^\s*<!doctype lake>/i.test(doc.body);
+        const lake = doc.content || doc.body_lake || doc.body_draft_asl || doc.body_asl || (bodyIsLake ? doc.body : '');
+        const hasBody = typeof doc.body === 'string' && !bodyIsLake;
+        return {
+            id: doc.id, slug: doc.slug, title: doc.title,
+            description: doc.description || '', format: doc.format,
+            origin_format: doc.origin_format ?? doc.originFormat,
+            public: doc.public, status: doc.status, word_count: doc.word_count,
+            created_at: doc.created_at, updated_at: doc.updated_at,
+            body: hasBody ? doc.body : this.extractTextFromLake(lake),
+            body_format: hasBody ? 'markdown' : 'markdown_approx',
+            body_is_lossy: Boolean(lake),
+            body_html: doc.body_html ?? doc.content_html,
+            ...(includeLake ? { body_lake: lake } : {})
+        };
+    }
+    checkExpectedUpdate(doc, expectedUpdatedAt) {
+        if (expectedUpdatedAt !== undefined && doc.updated_at !== expectedUpdatedAt) {
+            throw new Error('文档已发生变化，已停止覆盖；请重新读取文档后再编辑。');
+        }
+    }
+    async getDoc(bookId, slug, includeLake = false, includeDraft = false) {
         try {
             if (this.authType === 'token') {
                 const response = await this.client.get(`/repos/${bookId}/docs/${slug}?raw=1`);
@@ -288,23 +345,10 @@ class YuqueClient {
                     await this.getUserInfo();
                 }
                 const response = await this.client.get(`/api/docs/${slug}`, {
-                    params: { book_id: bookId }
+                    params: { book_id: bookId, ...(includeDraft ? { mode: 'edit' } : {}) }
                 });
                 const doc = response.data.data;
-                return {
-                    id: doc.id,
-                    slug: doc.slug,
-                    title: doc.title,
-                    description: doc.description || '',
-                    format: doc.format,
-                    public: doc.public,
-                    status: doc.status,
-                    word_count: doc.word_count,
-                    created_at: doc.created_at,
-                    updated_at: doc.updated_at,
-                    body: doc.body,
-                    body_html: doc.body_html
-                };
+                return this.readableCookieDoc(doc, includeLake);
             }
         }
         catch (error) {
@@ -313,6 +357,7 @@ class YuqueClient {
     }
     async createDoc(bookId, title, body, format = 'markdown', slug) {
         try {
+            this.validateBodyFormat(format);
             if (this.authType === 'token') {
                 const data = { title, body, format };
                 if (slug)
@@ -323,8 +368,7 @@ class YuqueClient {
             else {
                 const data = {
                     title,
-                    body,
-                    format,
+                    ...await this.prepareCookieBody(body, format),
                     type: 'Doc',
                     book_id: bookId,
                     insert_to_catalog: true
@@ -354,18 +398,30 @@ class YuqueClient {
     async updateDoc(bookId, docId, options) {
         try {
             const data = {};
-            if (options.title)
+            if (options.title !== undefined)
                 data.title = options.title;
-            if (options.body) {
-                data.body = options.body;
-                data.format = 'markdown';
-                data._lake_is_asl = false;
-            }
             if (this.authType === 'token') {
+                if (options.body !== undefined) {
+                    this.validateBodyFormat(options.format ?? 'markdown');
+                    data.body = options.body;
+                    data.format = options.format ?? 'markdown';
+                }
+                if (options.expected_updated_at !== undefined) {
+                    const current = (await this.client.get(`/repos/${bookId}/docs/${docId}?raw=1`)).data.data;
+                    this.checkExpectedUpdate(current, options.expected_updated_at);
+                }
                 const response = await this.client.put(`/repos/${bookId}/docs/${docId}`, data);
                 return response.data.data;
             }
             else {
+                if (options.body !== undefined) {
+                    Object.assign(data, await this.prepareCookieBody(options.body, options.format ?? 'markdown'));
+                }
+                if (options.body !== undefined || options.expected_updated_at !== undefined) {
+                    const current = (await this.client.get(`/api/docs/${docId}`, { params: { book_id: bookId } })).data.data;
+                    if (current.book_id !== bookId) throw new Error('文档不属于指定知识库，已停止写入');
+                    this.checkExpectedUpdate(current, options.expected_updated_at);
+                }
                 const response = await this.client.put(`/api/docs/${docId}`, data);
                 const doc = response.data.data;
                 return {
@@ -374,6 +430,7 @@ class YuqueClient {
                     title: doc.title,
                     description: doc.description || '',
                     format: doc.format,
+                    origin_format: doc.origin_format,
                     public: doc.public,
                     status: doc.status,
                     word_count: doc.word_count || 0,
@@ -618,35 +675,12 @@ class YuqueClient {
             this.handleError(error);
         }
     }
-    async getOrgDoc(bookId, slug) {
+    async getOrgDoc(bookId, slug, includeLake = false, includeDraft = false) {
         try {
-            const { cookie } = this.loadCookie();
-            if (!cookie) {
-                throw new Error('请先登录');
-            }
-            const response = await axios_1.default.get(`${ORG_BASE_URL}/api/docs/${slug}`, {
-                params: { book_id: bookId },
-                headers: {
-                    'Cookie': cookie,
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-                    'Referer': `${ORG_BASE_URL}/`
-                }
-            });
+            const httpClient = this.getOrgCookieClient();
+            const response = await httpClient.get(`/api/docs/${slug}`, { params: { book_id: bookId, ...(includeDraft ? { mode: 'edit' } : {}) } });
             const doc = response.data.data;
-            return {
-                id: doc.id,
-                slug: doc.slug,
-                title: doc.title,
-                description: doc.description || '',
-                format: doc.format,
-                public: doc.public,
-                status: doc.status,
-                word_count: doc.word_count,
-                created_at: doc.created_at,
-                updated_at: doc.updated_at,
-                body: doc.body,
-                body_html: doc.body_html
-            };
+            return this.readableCookieDoc(doc, includeLake);
         }
         catch (error) {
             this.handleError(error);
@@ -685,19 +719,9 @@ class YuqueClient {
     }
     async createOrgDoc(bookId, title, body, format = 'markdown') {
         try {
-            const { cookie, ctoken } = this.loadCookie();
-            if (!cookie) {
-                throw new Error('请先登录');
-            }
-            const response = await axios_1.default.post(`${ORG_BASE_URL}/api/books/${bookId}/docs`, { title, body, format, type: 'Doc' }, {
-                headers: {
-                    'Cookie': cookie,
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-                    'Referer': `${ORG_BASE_URL}/`,
-                    'x-csrf-token': ctoken
-                }
-            });
+            const httpClient = this.getOrgCookieClient();
+            const prepared = await this.prepareCookieBody(body, format, httpClient);
+            const response = await httpClient.post(`/api/books/${bookId}/docs`, { title, ...prepared, type: 'Doc' });
             const doc = response.data.data;
             return {
                 id: doc.id,
@@ -718,27 +742,18 @@ class YuqueClient {
     }
     async updateOrgDoc(docId, options) {
         try {
-            const { cookie, ctoken } = this.loadCookie();
-            if (!cookie) {
-                throw new Error('请先登录');
-            }
+            const httpClient = this.getOrgCookieClient();
             const data = {};
-            if (options.title)
+            if (options.title !== undefined)
                 data.title = options.title;
-            if (options.body) {
-                data.body = options.body;
-                data.format = 'markdown';
-                data._lake_is_asl = false;
+            if (options.body !== undefined) {
+                Object.assign(data, await this.prepareCookieBody(options.body, options.format ?? 'markdown', httpClient));
             }
-            const response = await axios_1.default.put(`${ORG_BASE_URL}/api/docs/${docId}`, data, {
-                headers: {
-                    'Cookie': cookie,
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-                    'Referer': `${ORG_BASE_URL}/`,
-                    'x-csrf-token': ctoken
-                }
-            });
+            if (options.expected_updated_at !== undefined) {
+                const current = (await httpClient.get(`/api/docs/${docId}`)).data.data;
+                this.checkExpectedUpdate(current, options.expected_updated_at);
+            }
+            const response = await httpClient.put(`/api/docs/${docId}`, data);
             const doc = response.data.data;
             return {
                 id: doc.id,
@@ -761,9 +776,23 @@ class YuqueClient {
     extractTextFromLake(lakeContent) {
         if (!lakeContent)
             return '';
+        const codeBlocks = [];
         // 移除 lake 格式的 meta 标签
         let text = lakeContent.replace(/<!doctype lake>/, '');
         text = text.replace(/<meta[^>]*>/g, '');
+        // 保留代码卡片。旧实现会把它当成未知 card 删除。
+        text = text.replace(/<card[^>]*name="codeblock"[^>]*value="data:([^"]*)"[^>]*>.*?<\/card>/gs, (match, encodedData) => {
+            try {
+                const data = JSON.parse(decodeURIComponent(encodedData));
+                const code = String(data.code || '');
+                const fences = code.match(/`+/g) || [];
+                const fence = '`'.repeat(Math.max(3, ...fences.map(s => s.length + 1)));
+                const language = String(data.mode || '').replace(/[\r\n`]/g, '');
+                codeBlocks.push(`\n${fence}${language}\n${code}\n${fence}\n`);
+                return `\u0000yuque-code-${codeBlocks.length - 1}\u0000`;
+            }
+            catch { return '\n[无法解析的代码卡片；请读取 body_lake]\n'; }
+        });
         // 提取图片 card 标签并转换为 Markdown 图片格式
         text = text.replace(/<card[^>]*name="image"[^>]*value="data:([^"]*)"[^>]*>/g, (match, encodedData) => {
             try {
@@ -813,6 +842,7 @@ class YuqueClient {
         text = text.replace(/&lt;/g, '<');
         text = text.replace(/&gt;/g, '>');
         text = text.replace(/&nbsp;/g, ' ');
+        text = text.replace(/\u0000yuque-code-(\d+)\u0000/g, (_, index) => codeBlocks[Number(index)]);
         return text.trim();
     }
     parseYuqueUrl(url) {
@@ -838,7 +868,7 @@ class YuqueClient {
             return null;
         }
     }
-    async getDocByUrl(url) {
+    async getDocByUrl(url, includeLake = false, includeDraft = false) {
         const parsed = this.parseYuqueUrl(url);
         if (!parsed) {
             throw new Error(`无效的语雀链接: ${url}\n支持的格式: https://www.yuque.com/{user}/{book}/{doc} 或 https://{org}.yuque.com/{group}/{book}/{doc}`);
@@ -853,7 +883,7 @@ class YuqueClient {
             const pageResponse = await axios_1.default.get(`${domain}/${namespace}/${docSlug}`, {
                 headers: {
                     'Cookie': cookie,
-                    'User-Agent': 'Mozilla/5.0',
+                    'User-Agent': BROWSER_USER_AGENT,
                     'Accept': 'text/html'
                 }
             });
@@ -869,32 +899,16 @@ class YuqueClient {
             const docInfo = appData.doc || {};
             // 使用 API 获取文档完整内容
             const docResponse = await axios_1.default.get(`${domain}/api/docs/${docInfo.slug}`, {
-                params: { book_id: bookInfo.id },
+                params: { book_id: bookInfo.id, ...(includeDraft ? { mode: 'edit' } : {}) },
                 headers: {
                     'Cookie': cookie,
-                    'User-Agent': 'Mozilla/5.0',
+                    'User-Agent': BROWSER_USER_AGENT,
                     'x-csrf-token': ctoken
                 }
             });
             const doc = docResponse.data.data;
-            // 从 lake 格式提取纯文本内容
-            const lakeContent = doc.content || '';
-            const plainText = this.extractTextFromLake(lakeContent);
             return {
-                doc: {
-                    id: doc.id,
-                    slug: doc.slug,
-                    title: doc.title,
-                    description: doc.description || '',
-                    format: doc.format,
-                    public: doc.public,
-                    status: doc.status,
-                    word_count: doc.word_count,
-                    created_at: doc.created_at,
-                    updated_at: doc.updated_at,
-                    body: plainText,
-                    body_html: lakeContent
-                },
+                doc: this.readableCookieDoc(doc, includeLake),
                 book: {
                     id: bookInfo.id,
                     name: bookInfo.name,
