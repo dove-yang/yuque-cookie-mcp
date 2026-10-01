@@ -452,9 +452,35 @@ const tools = [
         }
     }
 ];
+// format 描述调用方的输入格式；Cookie 写入统一转换为网页可编辑的 Lake。
+for (const tool of tools) {
+    if (['get_doc', 'get_org_doc', 'get_doc_by_url'].includes(tool.name)) {
+        tool.inputSchema.properties.include_lake = {
+            type: 'boolean',
+            description: '返回 body_lake 原始富文本（默认 false）。body 是便于阅读的近似 Markdown，不适合无损写回；保留复杂排版请读取原文并用 format: lake 更新。'
+        };
+        tool.inputSchema.properties.include_draft = {
+            type: 'boolean',
+            description: 'Cookie 模式读取编辑正文（含未发布内容），默认 false 读取已发布正文。创建/更新不自动发布，要核对刚写入的正文请设置 true。'
+        };
+    }
+    if (['create_doc', 'update_doc', 'create_org_doc', 'update_org_doc'].includes(tool.name)) {
+        tool.inputSchema.properties.format = {
+            type: 'string', enum: ['markdown', 'lake'], default: 'markdown',
+            description: 'body 的输入格式（默认 markdown）。Cookie 模式 Markdown 先转为 Lake 保存；lake 必须是包含 <!doctype lake> 的原始富文本。'
+        };
+        tool.inputSchema.properties.body.description = '正文输入；更新时将整体替换正文。默认 Markdown（转成 Lake 保存）；复杂卡片/排版需传 Lake 原文并指定 format: lake。';
+    }
+    if (['update_doc', 'update_org_doc'].includes(tool.name)) {
+        tool.inputSchema.properties.expected_updated_at = {
+            type: 'string',
+            description: '可选：读取时的 updated_at。写入前检查，若已变化则拒绝覆盖（尽力检查，非服务器原子锁）。'
+        };
+    }
+}
 const server = new index_js_1.Server({
     name: 'yuque-mcp',
-    version: '1.0.0',
+    version: require('./package.json').version,
 }, {
     capabilities: {
         tools: {},
@@ -568,18 +594,18 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                 break;
             }
             case 'get_doc': {
-                const { book_id, slug } = args;
-                result = await getClient().getDoc(book_id, slug);
+                const { book_id, slug, include_lake, include_draft } = args;
+                result = await getClient().getDoc(book_id, slug, include_lake, include_draft);
                 break;
             }
             case 'create_doc': {
-                const { book_id, title, body, slug } = args;
-                result = await getClient().createDoc(book_id, title, body, 'markdown', slug);
+                const { book_id, title, body, slug, format } = args;
+                result = await getClient().createDoc(book_id, title, body, format, slug);
                 break;
             }
             case 'update_doc': {
-                const { book_id, doc_id, title, body } = args;
-                result = await getClient().updateDoc(book_id, doc_id, { title, body });
+                const { book_id, doc_id, title, body, format, expected_updated_at } = args;
+                result = await getClient().updateDoc(book_id, doc_id, { title, body, format, expected_updated_at });
                 break;
             }
             case 'delete_doc': {
@@ -621,18 +647,18 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                 break;
             }
             case 'get_org_doc': {
-                const { book_id, slug } = args;
-                result = await getClient().getOrgDoc(book_id, slug);
+                const { book_id, slug, include_lake, include_draft } = args;
+                result = await getClient().getOrgDoc(book_id, slug, include_lake, include_draft);
                 break;
             }
             case 'create_org_doc': {
-                const { book_id, title, body } = args;
-                result = await getClient().createOrgDoc(book_id, title, body);
+                const { book_id, title, body, format } = args;
+                result = await getClient().createOrgDoc(book_id, title, body, format);
                 break;
             }
             case 'update_org_doc': {
-                const { doc_id, title, body } = args;
-                result = await getClient().updateOrgDoc(doc_id, { title, body });
+                const { doc_id, title, body, format, expected_updated_at } = args;
+                result = await getClient().updateOrgDoc(doc_id, { title, body, format, expected_updated_at });
                 break;
             }
             // ========== 知识库管理（创建/删除）==========
@@ -670,8 +696,8 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
             }
             // ========== URL 直接访问 ==========
             case 'get_doc_by_url': {
-                const { url } = args;
-                const data = await getClient().getDocByUrl(url);
+                const { url, include_lake, include_draft } = args;
+                const data = await getClient().getDocByUrl(url, include_lake, include_draft);
                 result = {
                     title: data.doc.title,
                     book_name: data.book.name,
@@ -681,6 +707,11 @@ server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
                     word_count: data.doc.word_count,
                     updated_at: data.doc.updated_at,
                     body: data.doc.body,
+                    format: data.doc.format,
+                    origin_format: data.doc.origin_format,
+                    body_format: data.doc.body_format,
+                    body_is_lossy: data.doc.body_is_lossy,
+                    ...(include_lake ? { body_lake: data.doc.body_lake } : {}),
                     url: data.url
                 };
                 break;

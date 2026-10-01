@@ -18,7 +18,8 @@
   },
   "scripts": {
     "start": "node index.js",
-    "login": "node login.js"
+    "login": "node login.js",
+    "test": "node --test compatibility.test.cjs"
   },
   "keywords": [
     "yuque",
